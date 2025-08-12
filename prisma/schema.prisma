@@ -27,6 +27,7 @@ model ShopifyProduct {
   title    String?
   handle   String?
   status   String?
+  cursor   String?
   images   Image[]
   variants Variant[]
 }
