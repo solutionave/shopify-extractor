@@ -27,6 +27,7 @@ model ShopifyProduct {
   title    String?
   handle   String?
   status   String?
+  cursor   String?
   images   Image[]
   variants Variant[]
 }
@@ -35,7 +36,7 @@ model Image {
   id  String  @id @default(cuid())
   src String?
 
-  ShopifyProduct   ShopifyProduct? @relation(fields: [shopifyProductId], references: [id])
+  ShopifyProduct   ShopifyProduct? @relation(fields: [shopifyProductId], references: [id], onDelete: Cascade)
   shopifyProductId String?
 }
 
@@ -44,6 +45,6 @@ model Variant {
   title            String?
   sku              String?
   price            String?
-  ShopifyProduct   ShopifyProduct? @relation(fields: [shopifyProductId], references: [id])
+  ShopifyProduct   ShopifyProduct? @relation(fields: [shopifyProductId], references: [id], onDelete: Cascade)
   shopifyProductId String?
 }

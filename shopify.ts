@@ -28,6 +28,7 @@ type AdminProduct = {
   title: string;
   handle: string | null;
   status: string | null;
+  cursor: string | null; // edge cursor for this product
   images: { src: string }[];
   variants: {
     id: string;
@@ -99,6 +100,7 @@ async function fetchAdminPage(first: number, after?: string | null) {
     title: e.node.title,
     handle: e.node.handle ?? null,
     status: e.node.status ?? null,
+    cursor: e.cursor ?? null,
     images: (e.node.images?.edges ?? []).map((ie: any) => ({
       src: ie.node.url,
     })),
@@ -132,49 +134,102 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
   }
 
   const pageSize = 100; // Shopify allows up to 250 in many cases - 100 is safe
-  let cursor: string | null = null;
+
+  // Resume from the last saved product cursor in DB, if any
+  const lastSaved = await prisma.shopifyProduct.findFirst({
+    where: { cursor: { not: null } },
+    orderBy: { cursor: "desc" }, // best-effort; Shopify cursors are opaque, but this gives a deterministic pick
+    select: { cursor: true },
+  });
+
+  let cursor: string | null = lastSaved?.cursor ?? null;
+  if (cursor) console.log(`Resuming from saved cursor checkpoint`);
   const all: AdminProduct[] = [];
+  let page = 0;
+  const initialStored = await prisma.shopifyProduct.count();
 
   /* Paginate until exhaustion */
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    console.log(all.length);
-    console.log(all.at(all.length - 1));
-
+    page += 1;
     const { items, next } = await fetchAdminPage(pageSize, cursor);
 
-    for (const item of items.slice(0,2)) {
-      await prisma.shopifyProduct.create({
-        data: {
-          id: item.id,
-          handle: item.handle,
-          status: item.status,
-          title: item.title,
-          images: {
-            createMany: {
-              data: item.images.map((img) => ({
-                src: img.src,
-              })),
-            },
+    // Determine created vs updated before writing for progress metrics
+    const ids = items.map((i) => i.id);
+    const existing = await prisma.shopifyProduct.findMany({
+      where: { id: { in: ids } },
+      select: { id: true },
+    });
+    const existingSet = new Set(existing.map((e) => e.id));
+    let createdCount = 0;
+    let updatedCount = 0;
+
+    for (const item of items) {
+      try {
+  // Upsert the product itself and persist the per-item edge cursor
+        await prisma.shopifyProduct.upsert({
+          where: { id: item.id },
+          create: {
+            id: item.id,
+            handle: item.handle,
+            status: item.status,
+            title: item.title,
+            cursor: item.cursor,
           },
-          variants: {
-            createMany: {
-              data: item.variants.map((variant) => ({
-                id: variant.id,
-                price: variant.price,
-                sku: variant.sku,
-                title: variant.title,
-              })),
-            },
+          update: {
+            handle: item.handle,
+            status: item.status,
+            title: item.title,
+            cursor: item.cursor,
           },
-        },
-      });
+        });
+  if (existingSet.has(item.id)) updatedCount += 1; else createdCount += 1;
+
+        // Replace images to avoid duplicates on resume
+        await prisma.image.deleteMany({ where: { shopifyProductId: item.id } });
+        if (item.images.length) {
+          await prisma.image.createMany({
+            data: item.images.map((img) => ({
+              src: img.src,
+              shopifyProductId: item.id,
+            })),
+          });
+        }
+
+        // Insert variants idempotently (id is unique)
+        if (item.variants.length) {
+          await prisma.variant.createMany({
+            data: item.variants.map((variant) => ({
+              id: variant.id,
+              price: variant.price ?? null,
+              sku: variant.sku ?? null,
+              title: variant.title,
+              shopifyProductId: item.id,
+            })),
+            skipDuplicates: true,
+          });
+        }
+      } catch (error) {
+        console.log(error);
+      }
     }
 
     all.push(...items);
     if (!next) break;
+    const totalStored = await prisma.shopifyProduct.count();
+    console.log(
+      `[page ${page}] processed: ${items.length} | created: ${createdCount} | updated: ${updatedCount} | total stored: ${totalStored} | hasNext: ${Boolean(
+        next
+      )}`
+    );
     cursor = next;
   }
+
+  // Final progress snapshot
+  const finalStored = await prisma.shopifyProduct.count();
+  console.log(
+    `[done] pages: ${page} | total fetched: ${all.length} | total stored: ${finalStored} (initial: ${initialStored})`
+  );
 
   return all;
 }
@@ -183,11 +238,11 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
  * Entry point - run and print all products.
  */
 (async () => {
+  // https://admin.shopify.com/api/shopify/114925-b6?operation=AppliedMetafieldDefinitionsForEdit&type=query
   try {
     console.log(">>>>>");
 
     const products = await extractShopifyProducts();
-    console.log(`Fetched ${products.length} products`);
     for (const p of products) {
       // One line per product for easy grepping
       console.log(JSON.stringify(p));
