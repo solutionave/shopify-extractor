@@ -82,3 +82,12 @@ model Metafield {
 
   @@unique([shopifyProductId, namespace, key])
 }
+
+// Stores pagination checkpoints for long-running syncs
+model ShopifySyncState {
+  key       String   @id // e.g., "products"
+  endCursor String?
+  sortKey   String? // e.g., "ID" or "UPDATED_AT"
+  reverse   Boolean? @default(false)
+  updatedAt DateTime @updatedAt
+}

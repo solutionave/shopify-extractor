@@ -51,7 +51,7 @@ const ADMIN_ENDPOINT_OP = (handle: string, operation: string) =>
 
 const ADMIN_QUERY = `#graphql
 query ProductsQuery($first:Int!, $after:String) {
-  products(first: $first, after: $after, reverse: false, sortKey: UPDATED_AT) {
+  products(first: $first, after: $after, reverse: false, sortKey: ID) {
     edges {
       cursor
       node {
@@ -159,16 +159,11 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
   }
 
   const pageSize = 100; // Shopify allows up to 250 in many cases - 100 is safe
-
-  // Resume from the last saved product cursor in DB, if any
-  const lastSaved = await prisma.shopifyProduct.findFirst({
-    where: { cursor: { not: null } },
-    orderBy: { cursor: "desc" }, // best-effort; Shopify cursors are opaque, but this gives a deterministic pick
-    select: { cursor: true },
-  });
-
-  let cursor: string | null = lastSaved?.cursor ?? null;
-  if (cursor) console.log(`Resuming from saved cursor checkpoint`);
+  // Resume from dedicated sync checkpoint (stable ordering by ID)
+  const SYNC_KEY = "products";
+  const syncState = await prisma.shopifySyncState.findUnique({ where: { key: SYNC_KEY } });
+  let cursor: string | null = syncState?.endCursor ?? null;
+  if (cursor) console.log(`Resuming from checkpoint: endCursor present`);
   const all: AdminProduct[] = [];
   let page = 0;
   const initialStored = await prisma.shopifyProduct.count();
@@ -192,8 +187,8 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
     let updatedCount = 0;
 
     // Process per-item DB work concurrently (limit to avoid DB overload)
-    const CONCURRENCY = 10;
-    await runWithConcurrency(items.slice(0, 1), CONCURRENCY, async (item) => {
+  const CONCURRENCY = 10;
+  await runWithConcurrency(items, CONCURRENCY, async (item) => {
       try {
         // Upsert product
         await prisma.shopifyProduct.upsert({
@@ -248,6 +243,12 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
     });
 
     all.push(...items);
+    // Update checkpoint after successfully persisting the page
+    await prisma.shopifySyncState.upsert({
+      where: { key: SYNC_KEY },
+      create: { key: SYNC_KEY, endCursor: next ?? null, sortKey: "ID", reverse: false },
+      update: { endCursor: next ?? null, sortKey: "ID", reverse: false },
+    });
     if (!next) break;
     storedTotal += createdCount;
     console.log(
@@ -258,7 +259,6 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
       )}`
     );
     cursor = next;
-    process.exit(0);
   }
 
   // Final progress snapshot
@@ -465,23 +465,88 @@ export async function getProductDetailById(productIdOrGid: string) {
   return product;
 }
 
-export async function deleteShopifyProduct() {
-  // implement delete api call
+/** ===================== PRODUCT DELETE (ADMIN) ===================== */
+
+const ADMIN_PRODUCT_DELETE_MUTATION = `#graphql
+mutation ProductDelete($input: ProductDeleteInput!) {
+  productDelete(input: $input) {
+    deletedProductId
+    userErrors { field message }
+  }
+}`;
+
+export async function deleteShopifyProduct(productIdOrGid: string) {
+  if (!ADMIN_STORE_HANDLE) throw new Error("Set ADMIN_STORE_HANDLE");
+  if (!ADMIN_COOKIE || ADMIN_COOKIE.includes("PASTE_FULL_COOKIE_STRING_HERE")) {
+    throw new Error("Paste your ADMIN_COOKIE string into shopify.ts");
+  }
+
+  const gid = toGid(productIdOrGid);
+  const body = JSON.stringify({
+    operationName: "ProductDelete",
+    variables: { input: { id: gid } },
+    query: ADMIN_PRODUCT_DELETE_MUTATION,
+  });
+
+  const res = await fetch(
+    ADMIN_ENDPOINT_OP(ADMIN_STORE_HANDLE, "ProductDelete"),
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Cookie: ADMIN_COOKIE,
+        Origin: "https://admin.shopify.com",
+        Referer: `https://admin.shopify.com/store/${ADMIN_STORE_HANDLE}/products/${gid.replace(
+          /.*\//,
+          ""
+        )}/delete`,
+        "apollographql-client-name": "core",
+        "x-shopify-web-force-proxy": "1",
+        "x-csrf-token": "QcHBhFofoV-CxDj7zZ4ranM79dz7DrIhVF7PzE",
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15",
+      },
+      body,
+    }
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Admin product delete failed ${res.status}: ${text}`);
+  }
+
+  const data = (await res.json()) as any;
+  const out = data?.data?.productDelete;
+  const userErrors = out?.userErrors || [];
+  if (userErrors.length) {
+    const msg = userErrors.map((e: any) => e?.message).filter(Boolean).join("; ");
+    throw new Error(`Shopify userErrors: ${msg || "unknown error"}`);
+  }
+
+  const deletedId = out?.deletedProductId as string | undefined;
+  if (deletedId) {
+    // Best-effort local cleanup; relies on FK cascade for children
+    await prisma.shopifyProduct.delete({ where: { id: deletedId } }).catch(() => undefined);
+  }
+  return { deletedProductId: deletedId, userErrors };
 }
 
 /**
  * Entry point - run and print all products.
  */
-(async () => {
-  // https://admin.shopify.com/api/shopify/114925-b6?operation=AppliedMetafieldDefinitionsForEdit&type=query
-  try {
-    const products = await extractShopifyProducts();
-    for (const p of products) {
-      // One line per product for easy grepping
-      console.log(JSON.stringify(p));
-    }
-  } catch (err: any) {
-    console.error("Error:", err?.message || err);
-    process.exitCode = 1;
-  }
-})();
+// (async () => {
+//   // https://admin.shopify.com/api/shopify/114925-b6?operation=AppliedMetafieldDefinitionsForEdit&type=query
+//   try {
+//     const result = await deleteShopifyProduct('7772054388759');
+//     console.log(JSON.stringify(result));
+//     // const products = await extractShopifyProducts();
+//     // for (const p of products) {
+//     //   // One line per product for easy grepping
+//     //   console.log(JSON.stringify(p));
+//     // }
+//   } catch (err: any) {
+//     console.error("Error:", err?.message || err);
+//     process.exitCode = 1;
+//   }
+// })();
