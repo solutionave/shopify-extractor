@@ -141,19 +141,32 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
     orderBy: { cursor: "desc" }, // best-effort; Shopify cursors are opaque, but this gives a deterministic pick
     select: { cursor: true },
   });
+
   let cursor: string | null = lastSaved?.cursor ?? null;
   if (cursor) console.log(`Resuming from saved cursor checkpoint`);
   const all: AdminProduct[] = [];
+  let page = 0;
+  const initialStored = await prisma.shopifyProduct.count();
 
   /* Paginate until exhaustion */
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    console.log("Extracted so far", all.length);
+    page += 1;
     const { items, next } = await fetchAdminPage(pageSize, cursor);
+
+    // Determine created vs updated before writing for progress metrics
+    const ids = items.map((i) => i.id);
+    const existing = await prisma.shopifyProduct.findMany({
+      where: { id: { in: ids } },
+      select: { id: true },
+    });
+    const existingSet = new Set(existing.map((e) => e.id));
+    let createdCount = 0;
+    let updatedCount = 0;
 
     for (const item of items) {
       try {
-        // Upsert the product itself and persist the per-item edge cursor
+  // Upsert the product itself and persist the per-item edge cursor
         await prisma.shopifyProduct.upsert({
           where: { id: item.id },
           create: {
@@ -170,6 +183,7 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
             cursor: item.cursor,
           },
         });
+  if (existingSet.has(item.id)) updatedCount += 1; else createdCount += 1;
 
         // Replace images to avoid duplicates on resume
         await prisma.image.deleteMany({ where: { shopifyProductId: item.id } });
@@ -202,8 +216,20 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
 
     all.push(...items);
     if (!next) break;
+    const totalStored = await prisma.shopifyProduct.count();
+    console.log(
+      `[page ${page}] processed: ${items.length} | created: ${createdCount} | updated: ${updatedCount} | total stored: ${totalStored} | hasNext: ${Boolean(
+        next
+      )}`
+    );
     cursor = next;
   }
+
+  // Final progress snapshot
+  const finalStored = await prisma.shopifyProduct.count();
+  console.log(
+    `[done] pages: ${page} | total fetched: ${all.length} | total stored: ${finalStored} (initial: ${initialStored})`
+  );
 
   return all;
 }
@@ -217,7 +243,6 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
     console.log(">>>>>");
 
     const products = await extractShopifyProducts();
-    console.log(`Fetched ${products.length} products`);
     for (const p of products) {
       // One line per product for easy grepping
       console.log(JSON.stringify(p));
