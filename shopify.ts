@@ -138,13 +138,12 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
   /* Paginate until exhaustion */
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    console.log(all.length);
-    console.log(all.at(all.length - 1));
-
+    console.log("Extracted so far", all.length);
     const { items, next } = await fetchAdminPage(pageSize, cursor);
 
-    for (const item of items.slice(0,2)) {
-      await prisma.shopifyProduct.create({
+    for (const item of items) {
+      try {
+        await prisma.shopifyProduct.create({
         data: {
           id: item.id,
           handle: item.handle,
@@ -169,6 +168,10 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
           },
         },
       });
+      } catch (error) {
+        console.log(error);
+        
+      }
     }
 
     all.push(...items);
@@ -183,6 +186,7 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
  * Entry point - run and print all products.
  */
 (async () => {
+  // https://admin.shopify.com/api/shopify/114925-b6?operation=AppliedMetafieldDefinitionsForEdit&type=query
   try {
     console.log(">>>>>");
 
