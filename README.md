@@ -68,3 +68,27 @@ How to get the token:
 Notes:
 
 - This script only logs products. If you want them saved to the DB, we can wire a Prisma model and upsert logic next.
+
+## Fetch a single product detail (Admin session cookie)
+
+You can fetch a single product's details directly from the Shopify Admin GraphQL proxy using your current Admin session cookie captured from DevTools.
+
+Steps:
+
+1) Open `shopify.ts` and set:
+
+- `ADMIN_STORE_HANDLE` to your store handle like `114925-b6` (from https://admin.shopify.com/store/114925-b6)
+- `ADMIN_COOKIE` to the full Cookie header you copied from Safari/Chrome DevTools while authenticated in Admin
+
+2) Run with the product ID (either numeric like `7727080505367` or a full gid like `gid://shopify/Product/7727080505367`):
+
+```bash
+PRODUCT_ID=7727080505367 bun run shopify.ts
+```
+
+The script will:
+
+- Call the Admin proxy with the `ProductDetailQuery`
+- Upsert the product in the local DB (title, handle, status)
+- Replace images and upsert variants for that product
+- Print the full product object (as returned by Admin GraphQL) to stdout

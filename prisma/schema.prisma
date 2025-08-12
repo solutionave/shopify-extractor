@@ -23,18 +23,31 @@ model SheetProduct {
 }
 
 model ShopifyProduct {
-  id       String    @id
-  title    String?
-  handle   String?
-  status   String?
-  cursor   String?
-  images   Image[]
-  variants Variant[]
+  id              String   @id
+  title           String?
+  handle          String?
+  status          String?
+  cursor          String?
+  description     String?
+  descriptionHtml String?
+  vendor          String?
+  productType     String?
+  tags            String[] @default([])
+
+  images     Image[]
+  variants   Variant[]
+  metafields Metafield[]
+
+  // Optional structured data captured from ProductDetail
+  productOptions Json?
 }
 
 model Image {
-  id  String  @id @default(cuid())
-  src String?
+  id      String  @id @default(cuid())
+  src     String?
+  altText String?
+  width   Int?
+  height  Int?
 
   ShopifyProduct   ShopifyProduct? @relation(fields: [shopifyProductId], references: [id], onDelete: Cascade)
   shopifyProductId String?
@@ -45,6 +58,27 @@ model Variant {
   title            String?
   sku              String?
   price            String?
+  compareAtPrice   String?
+  barcode          String?
+  weight           Float?
+  weightUnit       String?
+  imageSrc         String?
+  selectedOptions  Json?
   ShopifyProduct   ShopifyProduct? @relation(fields: [shopifyProductId], references: [id], onDelete: Cascade)
   shopifyProductId String?
+}
+
+model Metafield {
+  id               String          @id
+  namespace        String
+  key              String
+  type             String?
+  value            String?
+  ShopifyProduct   ShopifyProduct? @relation(fields: [shopifyProductId], references: [id], onDelete: Cascade)
+  shopifyProductId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([shopifyProductId, namespace, key])
 }
