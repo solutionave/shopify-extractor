@@ -118,6 +118,25 @@ async function fetchAdminPage(first: number, after?: string | null) {
   } as const;
 }
 
+// Simple concurrency limiter for async work (pool pattern)
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>
+) {
+  let i = 0;
+  const poolSize = Math.min(limit, items.length);
+  const runners = new Array(poolSize).fill(0).map(async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) break;
+  const item = items[idx]!; // idx < items.length ensured above
+  await worker(item, idx);
+    }
+  });
+  await Promise.all(runners);
+}
+
 /**
  * Fetch all products via Admin GraphQL using your current cookie.
  */
@@ -147,12 +166,13 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
   const all: AdminProduct[] = [];
   let page = 0;
   const initialStored = await prisma.shopifyProduct.count();
+  let storedTotal = initialStored;
 
   /* Paginate until exhaustion */
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    page += 1;
-    const { items, next } = await fetchAdminPage(pageSize, cursor);
+  page += 1;
+  const { items, next } = await fetchAdminPage(pageSize, cursor);
 
     // Determine created vs updated before writing for progress metrics
     const ids = items.map((i) => i.id);
@@ -164,9 +184,11 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
     let createdCount = 0;
     let updatedCount = 0;
 
-    for (const item of items) {
+    // Process per-item DB work concurrently (limit to avoid DB overload)
+    const CONCURRENCY = 10;
+    await runWithConcurrency(items, CONCURRENCY, async (item) => {
       try {
-  // Upsert the product itself and persist the per-item edge cursor
+        // Upsert product
         await prisma.shopifyProduct.upsert({
           where: { id: item.id },
           create: {
@@ -183,7 +205,7 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
             cursor: item.cursor,
           },
         });
-  if (existingSet.has(item.id)) updatedCount += 1; else createdCount += 1;
+        if (existingSet.has(item.id)) updatedCount += 1; else createdCount += 1;
 
         // Replace images to avoid duplicates on resume
         await prisma.image.deleteMany({ where: { shopifyProductId: item.id } });
@@ -212,16 +234,12 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
       } catch (error) {
         console.log(error);
       }
-    }
+    });
 
     all.push(...items);
     if (!next) break;
-    const totalStored = await prisma.shopifyProduct.count();
-    console.log(
-      `[page ${page}] processed: ${items.length} | created: ${createdCount} | updated: ${updatedCount} | total stored: ${totalStored} | hasNext: ${Boolean(
-        next
-      )}`
-    );
+  storedTotal += createdCount;
+  console.log(`[page ${page}] processed: ${items.length} | created: ${createdCount} | updated: ${updatedCount} | total stored: ${storedTotal} | hasNext: ${Boolean(next)}`);
     cursor = next;
   }
 
