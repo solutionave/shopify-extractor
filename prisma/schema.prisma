@@ -1,0 +1,49 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model SheetProduct {
+  id            Int     @id @default(autoincrement())
+  Title         String?
+  ProductLink   String?
+  ImageLink     String?
+  AffiliateLink String?
+}
+
+model ShopifyProduct {
+  id       String    @id
+  title    String?
+  handle   String?
+  status   String?
+  images   Image[]
+  variants Variant[]
+}
+
+model Image {
+  id  String  @id @default(cuid())
+  src String?
+
+  ShopifyProduct   ShopifyProduct? @relation(fields: [shopifyProductId], references: [id])
+  shopifyProductId String?
+}
+
+model Variant {
+  id               String          @id @unique
+  title            String?
+  sku              String?
+  price            String?
+  ShopifyProduct   ShopifyProduct? @relation(fields: [shopifyProductId], references: [id])
+  shopifyProductId String?
+}
