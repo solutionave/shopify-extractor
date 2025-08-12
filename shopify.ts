@@ -43,9 +43,15 @@ type AdminProduct = {
 const ADMIN_ENDPOINT = (handle: string) =>
   `https://admin.shopify.com/api/shopify/${handle}?operation=ProductsQuery&type=query`;
 
+// Endpoint helper that lets us specify the "operation" name per request
+const ADMIN_ENDPOINT_OP = (handle: string, operation: string) =>
+  `https://admin.shopify.com/api/shopify/${handle}?operation=${encodeURIComponent(
+    operation
+  )}&type=query`;
+
 const ADMIN_QUERY = `#graphql
 query ProductsQuery($first:Int!, $after:String) {
-  products(first: $first, after: $after, reverse: false, sortKey: UPDATED_AT) {
+  products(first: $first, after: $after, reverse: false, sortKey: ID) {
     edges {
       cursor
       node {
@@ -118,6 +124,25 @@ async function fetchAdminPage(first: number, after?: string | null) {
   } as const;
 }
 
+// Simple concurrency limiter for async work (pool pattern)
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>
+) {
+  let i = 0;
+  const poolSize = Math.min(limit, items.length);
+  const runners = new Array(poolSize).fill(0).map(async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) break;
+      const item = items[idx]!; // idx < items.length ensured above
+      await worker(item, idx);
+    }
+  });
+  await Promise.all(runners);
+}
+
 /**
  * Fetch all products via Admin GraphQL using your current cookie.
  */
@@ -134,19 +159,15 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
   }
 
   const pageSize = 100; // Shopify allows up to 250 in many cases - 100 is safe
-
-  // Resume from the last saved product cursor in DB, if any
-  const lastSaved = await prisma.shopifyProduct.findFirst({
-    where: { cursor: { not: null } },
-    orderBy: { cursor: "desc" }, // best-effort; Shopify cursors are opaque, but this gives a deterministic pick
-    select: { cursor: true },
-  });
-
-  let cursor: string | null = lastSaved?.cursor ?? null;
-  if (cursor) console.log(`Resuming from saved cursor checkpoint`);
+  // Resume from dedicated sync checkpoint (stable ordering by ID)
+  const SYNC_KEY = "products";
+  const syncState = await prisma.shopifySyncState.findUnique({ where: { key: SYNC_KEY } });
+  let cursor: string | null = syncState?.endCursor ?? null;
+  if (cursor) console.log(`Resuming from checkpoint: endCursor present`);
   const all: AdminProduct[] = [];
   let page = 0;
   const initialStored = await prisma.shopifyProduct.count();
+  let storedTotal = initialStored;
 
   /* Paginate until exhaustion */
   // eslint-disable-next-line no-constant-condition
@@ -156,6 +177,7 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
 
     // Determine created vs updated before writing for progress metrics
     const ids = items.map((i) => i.id);
+
     const existing = await prisma.shopifyProduct.findMany({
       where: { id: { in: ids } },
       select: { id: true },
@@ -164,9 +186,11 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
     let createdCount = 0;
     let updatedCount = 0;
 
-    for (const item of items) {
+    // Process per-item DB work concurrently (limit to avoid DB overload)
+  const CONCURRENCY = 10;
+  await runWithConcurrency(items, CONCURRENCY, async (item) => {
       try {
-  // Upsert the product itself and persist the per-item edge cursor
+        // Upsert product
         await prisma.shopifyProduct.upsert({
           where: { id: item.id },
           create: {
@@ -183,7 +207,8 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
             cursor: item.cursor,
           },
         });
-  if (existingSet.has(item.id)) updatedCount += 1; else createdCount += 1;
+        if (existingSet.has(item.id)) updatedCount += 1;
+        else createdCount += 1;
 
         // Replace images to avoid duplicates on resume
         await prisma.image.deleteMany({ where: { shopifyProductId: item.id } });
@@ -209,16 +234,27 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
             skipDuplicates: true,
           });
         }
+
+
+        await getProductDetailById(item.id)
       } catch (error) {
         console.log(error);
       }
-    }
+    });
 
     all.push(...items);
+    // Update checkpoint after successfully persisting the page
+    await prisma.shopifySyncState.upsert({
+      where: { key: SYNC_KEY },
+      create: { key: SYNC_KEY, endCursor: next ?? null, sortKey: "ID", reverse: false },
+      update: { endCursor: next ?? null, sortKey: "ID", reverse: false },
+    });
     if (!next) break;
-    const totalStored = await prisma.shopifyProduct.count();
+    storedTotal += createdCount;
     console.log(
-      `[page ${page}] processed: ${items.length} | created: ${createdCount} | updated: ${updatedCount} | total stored: ${totalStored} | hasNext: ${Boolean(
+      `[page ${page}] processed: ${
+        items.length
+      } | created: ${createdCount} | updated: ${updatedCount} | total stored: ${storedTotal} | hasNext: ${Boolean(
         next
       )}`
     );
@@ -234,21 +270,283 @@ export async function extractShopifyProducts(): Promise<AdminProduct[]> {
   return all;
 }
 
+export async function getProductDetail() {
+  // Keeping a no-arg export for backward-compatibility; prefer getProductDetailById(productId)
+  throw new Error(
+    "Use getProductDetailById(productId) with a numeric id or a gid:// string"
+  );
+}
+
+/** ===================== PRODUCT DETAIL (ADMIN) ===================== */
+
+const ADMIN_PRODUCT_DETAIL_QUERY = `#graphql
+query ProductDetailQuery($id: ID!) {
+  product(id: $id) {
+    id
+    title
+    handle
+    status
+    description
+    descriptionHtml
+    vendor
+    productType
+    tags
+    options { id name values }
+    featuredImage { id url altText width height }
+    images(first: 100) { edges { node { id url altText width height } } }
+    variants(first: 100) {
+      edges {
+        node {
+          id
+          title
+          sku
+          price
+          compareAtPrice
+          barcode
+          weight
+          weightUnit
+          selectedOptions { name value }
+          image { id url altText }
+        }
+      }
+    }
+    metafields(first: 50) { edges { node { id namespace key type value } } }
+  }
+}`;
+
+function toGid(productIdOrGid: string) {
+  if (productIdOrGid.startsWith("gid://")) return productIdOrGid;
+  // Accept numeric id like "7727080505367"
+  return `gid://shopify/Product/${productIdOrGid}`;
+}
+
+export async function getProductDetailById(productIdOrGid: string) {
+  if (!ADMIN_STORE_HANDLE) throw new Error("Set ADMIN_STORE_HANDLE");
+  if (!ADMIN_COOKIE || ADMIN_COOKIE.includes("PASTE_FULL_COOKIE_STRING_HERE")) {
+    throw new Error("Paste your ADMIN_COOKIE string into shopify.ts");
+  }
+
+  const gid = toGid(productIdOrGid);
+  const body = JSON.stringify({
+    operationName: "ProductDetailQuery",
+    variables: { id: gid },
+    query: ADMIN_PRODUCT_DETAIL_QUERY,
+  });
+
+  const res = await fetch(
+    ADMIN_ENDPOINT_OP(ADMIN_STORE_HANDLE, "ProductDetailQuery"),
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Cookie: ADMIN_COOKIE,
+        Origin: "https://admin.shopify.com",
+        Referer: `https://admin.shopify.com/store/${ADMIN_STORE_HANDLE}/products/${gid.replace(
+          /.*\//,
+          ""
+        )}`,
+        "apollographql-client-name": "core",
+        "x-shopify-web-force-proxy": "1",
+        "x-csrf-token": "QcHBhFofoV-CxDj7zZ4ranM79dz7DrIhVF7PzE",
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15",
+      },
+      body,
+    }
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Admin product detail fetch failed ${res.status}: ${text}`);
+  }
+
+  const data = (await res.json()) as any;
+  const product = data?.data?.product;
+  if (!product) {
+    throw new Error("Product not found or response malformed");
+  }
+
+  // Persist the core fields + replace images; upsert variants (idempotent)
+  await prisma.shopifyProduct.upsert({
+    where: { id: product.id },
+    create: {
+      id: product.id,
+      title: product.title ?? null,
+      handle: product.handle ?? null,
+      status: product.status ?? null,
+      description: product.description ?? null,
+      descriptionHtml: product.descriptionHtml ?? null,
+      vendor: product.vendor ?? null,
+      productType: product.productType ?? null,
+      tags: Array.isArray(product.tags) ? product.tags : [],
+      productOptions: product.options ?? null,
+      cursor: null, // not applicable for a single fetch
+    },
+    update: {
+      title: product.title ?? null,
+      handle: product.handle ?? null,
+      status: product.status ?? null,
+      description: product.description ?? null,
+      descriptionHtml: product.descriptionHtml ?? null,
+      vendor: product.vendor ?? null,
+      productType: product.productType ?? null,
+      tags: Array.isArray(product.tags) ? product.tags : [],
+      productOptions: product.options ?? null,
+    },
+  });
+
+  // Replace images for this product
+  await prisma.image.deleteMany({ where: { shopifyProductId: product.id } });
+  const imgs = (product.images?.edges ?? [])
+    .map((e: any) => e?.node)
+    .filter(Boolean)
+    .map((n: any) => ({
+      src: n?.url ?? null,
+      altText: n?.altText ?? null,
+      width: typeof n?.width === "number" ? n.width : null,
+      height: typeof n?.height === "number" ? n.height : null,
+    }))
+    .filter((i: any) => Boolean(i.src));
+  if (imgs.length) {
+    await prisma.image.createMany({
+      data: imgs.map((i: any) => ({
+        src: i.src,
+        altText: i.altText,
+        width: i.width ?? undefined,
+        height: i.height ?? undefined,
+        shopifyProductId: product.id,
+      })),
+    });
+  }
+
+  // Upsert variants
+  const variants: any[] = (product.variants?.edges ?? [])
+    .map((e: any) => e?.node)
+    .filter(Boolean);
+  if (variants.length) {
+    await prisma.variant.createMany({
+      data: variants.map((v: any) => ({
+        id: v.id,
+        title: v.title ?? null,
+        sku: v.sku ?? null,
+        price: v.price ?? null,
+        compareAtPrice: v.compareAtPrice ?? null,
+        barcode: v.barcode ?? null,
+        weight: typeof v?.weight === "number" ? v.weight : null,
+        weightUnit: v.weightUnit ?? null,
+        imageSrc: v?.image?.url ?? null,
+        selectedOptions: v?.selectedOptions ?? null,
+        shopifyProductId: product.id,
+      })),
+      skipDuplicates: true,
+    });
+  }
+
+  // Refresh metafields for this product
+  const metafields: any[] = (product.metafields?.edges ?? [])
+    .map((e: any) => e?.node)
+    .filter(Boolean);
+  if (metafields.length) {
+    await prisma.metafield.deleteMany({ where: { shopifyProductId: product.id } });
+    await prisma.metafield.createMany({
+      data: metafields.map((m: any) => ({
+        id: m.id,
+        namespace: m.namespace,
+        key: m.key,
+        type: m.type ?? null,
+        value: m.value ?? null,
+        shopifyProductId: product.id,
+      })),
+      skipDuplicates: true,
+    });
+  }
+
+  return product;
+}
+
+/** ===================== PRODUCT DELETE (ADMIN) ===================== */
+
+const ADMIN_PRODUCT_DELETE_MUTATION = `#graphql
+mutation ProductDelete($input: ProductDeleteInput!) {
+  productDelete(input: $input) {
+    deletedProductId
+    userErrors { field message }
+  }
+}`;
+
+export async function deleteShopifyProduct(productIdOrGid: string) {
+  if (!ADMIN_STORE_HANDLE) throw new Error("Set ADMIN_STORE_HANDLE");
+  if (!ADMIN_COOKIE || ADMIN_COOKIE.includes("PASTE_FULL_COOKIE_STRING_HERE")) {
+    throw new Error("Paste your ADMIN_COOKIE string into shopify.ts");
+  }
+
+  const gid = toGid(productIdOrGid);
+  const body = JSON.stringify({
+    operationName: "ProductDelete",
+    variables: { input: { id: gid } },
+    query: ADMIN_PRODUCT_DELETE_MUTATION,
+  });
+
+  const res = await fetch(
+    ADMIN_ENDPOINT_OP(ADMIN_STORE_HANDLE, "ProductDelete"),
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Cookie: ADMIN_COOKIE,
+        Origin: "https://admin.shopify.com",
+        Referer: `https://admin.shopify.com/store/${ADMIN_STORE_HANDLE}/products/${gid.replace(
+          /.*\//,
+          ""
+        )}/delete`,
+        "apollographql-client-name": "core",
+        "x-shopify-web-force-proxy": "1",
+        "x-csrf-token": "QcHBhFofoV-CxDj7zZ4ranM79dz7DrIhVF7PzE",
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15",
+      },
+      body,
+    }
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Admin product delete failed ${res.status}: ${text}`);
+  }
+
+  const data = (await res.json()) as any;
+  const out = data?.data?.productDelete;
+  const userErrors = out?.userErrors || [];
+  if (userErrors.length) {
+    const msg = userErrors.map((e: any) => e?.message).filter(Boolean).join("; ");
+    throw new Error(`Shopify userErrors: ${msg || "unknown error"}`);
+  }
+
+  const deletedId = out?.deletedProductId as string | undefined;
+  if (deletedId) {
+    // Best-effort local cleanup; relies on FK cascade for children
+    await prisma.shopifyProduct.delete({ where: { id: deletedId } }).catch(() => undefined);
+  }
+  return { deletedProductId: deletedId, userErrors };
+}
+
 /**
  * Entry point - run and print all products.
  */
-(async () => {
-  // https://admin.shopify.com/api/shopify/114925-b6?operation=AppliedMetafieldDefinitionsForEdit&type=query
-  try {
-    console.log(">>>>>");
-
-    const products = await extractShopifyProducts();
-    for (const p of products) {
-      // One line per product for easy grepping
-      console.log(JSON.stringify(p));
-    }
-  } catch (err: any) {
-    console.error("Error:", err?.message || err);
-    process.exitCode = 1;
-  }
-})();
+// (async () => {
+//   // https://admin.shopify.com/api/shopify/114925-b6?operation=AppliedMetafieldDefinitionsForEdit&type=query
+//   try {
+//     const result = await deleteShopifyProduct('7772054388759');
+//     console.log(JSON.stringify(result));
+//     // const products = await extractShopifyProducts();
+//     // for (const p of products) {
+//     //   // One line per product for easy grepping
+//     //   console.log(JSON.stringify(p));
+//     // }
+//   } catch (err: any) {
+//     console.error("Error:", err?.message || err);
+//     process.exitCode = 1;
+//   }
+// })();

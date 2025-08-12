@@ -2,7 +2,7 @@
 // Usage (public sheet): set SHEET_ID (and optional SHEET_GID) env vars, then run `bun run index.ts`
 
 import { getPrisma } from "./libs/utils";
-import { extractShopifyProducts } from "./shopify";
+import { deleteShopifyProduct, extractShopifyProducts } from "./shopify";
 
 const prisma = getPrisma();
 
@@ -170,10 +170,6 @@ function readDataFromGSheet() {
 
 // Entry point: prioritize Shopify fetch if env is set; else keep previous demo
 (async () => {
-  const hasShopify = Boolean(process.env.SHOPIFY_SHOP && process.env.SHOPIFY_ACCESS_TOKEN);
-  if (hasShopify || true) {
-    await extractShopifyProducts();
-  } else {
-  readDataFromGSheet();
-  }
+  await extractShopifyProducts();
+  // readDataFromGSheet();
 })();
